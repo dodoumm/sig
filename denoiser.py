@@ -1,4 +1,4 @@
-"""Traditional (non-ML) speech denoiser — 2nd version.
+"""Traditional (non-ML) speech denoiser — 3rd version (2nd version + speech-floor correction).
 
 Pipeline (per file, noisy input only; clean speech is never used):
   1. STFT (Hann, 64 ms window, 8 ms hop @16 kHz; scaled for other sample rates)
@@ -12,7 +12,10 @@ Pipeline (per file, noisy input only; clean speech is never used):
      of the first output restores voiced harmonics; the a priori SNR is re-estimated
      from it and the LSA gain recomputed
   6. Frame-level speech-absence attenuation (-3 dB in frames whose estimated SNR is low)
-  7. ISTFT (overlap-add), output length = input length
+  7. Speech-floor correction (3rd version): the noise estimate is lowered by the file's own
+     expected speech floor (-19 dB / -15 dB below 300 Hz under its blind mean speech PSD),
+     then steps 3-6 are run again
+  8. ISTFT (overlap-add), output length = input length
 
 Parameters were selected on a fixed 320-file subset of TRAIN (dev/tune.py);
 VALIDATION was used only to check the result.
@@ -45,6 +48,10 @@ class Config:
     vad_atten_db: float = -3.0       # extra attenuation in speech-absent frames (0 = off)
     vad_theta_db: float = 0.0        # frame SNR (dB) where speech presence = 0.5
     vad_width_db: float = 2.0        # slope of the sigmoid
+    # speech-floor correction of the noise estimate (3rd version; None = off -> 2nd version)
+    floor_db: float = -19.0          # floor relative to the blind mean speech PSD, above 300 Hz
+    floor_low_db: float = -15.0      # same, below 300 Hz
+    floor_keep: float = 0.1          # never lower the noise estimate by more than 10 dB
 
 
 def _stft(x, cfg, sr):
@@ -134,15 +141,25 @@ def decision_directed(gamma, cfg):
     return out
 
 
-def enhance(x, sr=16000, cfg=Config()):
-    """Denoise a 1-D waveform. Returns a float64 array of the same length."""
-    x = np.asarray(x, dtype=np.float64)
-    n = len(x)
-    if n < cfg.n_fft:
-        return x.copy()
-    _, _, z = _stft(x, cfg, sr)
-    power = np.abs(z) ** 2
-    noise = track_noise(power, cfg)
+def speech_floor_correction(gains, power, noise, cfg, sr):
+    """Remove the always-present speech floor from the noise estimate (3rd version).
+
+    In continuous speech the quietest moments still carry a low-level speech spectrum
+    (voicing, decays). In bands where the real noise is weak, the noise estimate of steps 2
+    is that speech floor, so speech gets suppressed. The floor is modelled from the file's
+    own blind speech spectrum S(f) = time-mean of |S_hat|^2 from the first pass:
+        F(f) = 10^(r/10) * S(f),  r = floor_low_db below 300 Hz, floor_db above,
+    and the corrected noise is max(N - F, floor_keep * N).
+    """
+    S = (gains ** 2 * power)[:, _inner(power.shape[1])].mean(axis=1)
+    hz = np.linspace(0, sr / 2, len(S))
+    r = np.where(hz < 300.0, cfg.floor_low_db, cfg.floor_db)
+    F = (10 ** (r / 10) * S)[:, None]
+    return np.maximum(noise - F, cfg.floor_keep * noise)
+
+
+def _gains(z, power, noise, n, cfg, sr):
+    """Steps 3-6 of the pipeline for a given noise PSD."""
     gamma = np.minimum(power / noise, 1e4)
     xi_min = 10 ** (cfg.xi_min_db / 10)
 
@@ -163,5 +180,20 @@ def enhance(x, sr=16000, cfg=Config()):
         snr_db = 10 * np.log10(np.maximum(frame_snr, 1e-10))
         p = 1.0 / (1.0 + np.exp(-(snr_db - cfg.vad_theta_db) / cfg.vad_width_db))
         gains = gains * (p + (1 - p) * 10 ** (cfg.vad_atten_db / 20))[None, :]
+    return gains
 
+
+def enhance(x, sr=16000, cfg=Config()):
+    """Denoise a 1-D waveform. Returns a float64 array of the same length."""
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    if n < cfg.n_fft:
+        return x.copy()
+    _, _, z = _stft(x, cfg, sr)
+    power = np.abs(z) ** 2
+    noise = track_noise(power, cfg)
+    gains = _gains(z, power, noise, n, cfg, sr)                  # first pass (= 2nd version)
+    if cfg.floor_db is not None:                                 # second pass with corrected noise
+        noise = speech_floor_correction(gains, power, noise, cfg, sr)
+        gains = _gains(z, power, noise, n, cfg, sr)
     return _istft(gains * z, n, cfg, sr)
