@@ -1,4 +1,4 @@
-"""Traditional (non-ML) speech denoiser — 3rd version (2nd version + speech-floor correction).
+"""Traditional (non-ML) speech denoiser — 4th version (3rd version + fixed band shaping and output stage).
 
 Pipeline (per file, noisy input only; clean speech is never used):
   1. STFT (Hann, 64 ms window, 8 ms hop @16 kHz; scaled for other sample rates)
@@ -15,15 +15,30 @@ Pipeline (per file, noisy input only; clean speech is never used):
   7. Speech-floor correction (3rd version): the noise estimate is lowered by the file's own
      expected speech floor (-19 dB / -15 dB below 300 Hz under its blind mean speech PSD),
      then steps 3-6 are run again
-  8. ISTFT (overlap-add), output length = input length
+  8. Low-band weighting of the gain (4th version): 400 Hz, 6th-order Butterworth-shaped high-pass
+     magnitude, never below -20 dB
+  9. ISTFT (overlap-add), output length = input length
+ 10. Output stage (4th version, time domain):
+     a. zero-phase high-band shelf: 10th-order Butterworth low-pass L(y) (sosfiltfilt) and
+        y' = L(y) + 10^(-29/20) (y - L(y))  -> components well above 625 Hz are ~29 dB lower
+     b. temporal gate: 40 ms RMS vs. the file's own 20th percentile; gain 0.65 below +6 dB,
+        ramping to 1 at +12 dB, smoothed over 60 ms. Skipped when >= 60 % of the sub-1 kHz
+        noise power (quietest 10 % of frames of the noisy input) sits in its 5 strongest bins
+        (strong narrow-band tones such as dial tones)
+     c. output gain up to x1.5, limited so that |peak| <= 0.999
+     Steps 8 and 10 follow post-processing found in reference code shared by another team
+     (PESQ 2.8226 package); they were re-implemented here on top of the 3rd version and
+     re-validated (see README).
 
-Parameters were selected on a fixed 320-file subset of TRAIN (dev/tune.py);
-VALIDATION was used only to check the result.
+Steps 1-7: parameters selected on a fixed 320-file subset of TRAIN (dev/tune.py).
+Steps 8 and 10: constants taken from the reference code (chosen there on public train/validation);
+checked here on TRAIN 320 and VALIDATION.
 """
 from dataclasses import dataclass
 
 import numpy as np
 from scipy import signal
+from scipy.ndimage import uniform_filter1d
 from scipy.special import exp1
 
 
@@ -52,6 +67,17 @@ class Config:
     floor_db: float = -19.0          # floor relative to the blind mean speech PSD, above 300 Hz
     floor_low_db: float = -15.0      # same, below 300 Hz
     floor_keep: float = 0.1          # never lower the noise estimate by more than 10 dB
+    # 4th version: fixed band shaping and output stage (None/0 = off -> 3rd version)
+    hp_hz: float = 400.0             # corner of the low-band gain weighting
+    hp_order: int = 6
+    hp_floor_db: float = -20.0       # the weighting never attenuates more than this
+    shelf_hz: float = 625.0          # zero-phase high-band shelf (low-pass part)
+    shelf_order: int = 10
+    shelf_db: float = 29.0           # attenuation of the residual high band
+    gate_threshold_db: float = 6.0   # temporal gate: level above the 20th-percentile RMS
+    gate_min_gain: float = 0.65
+    gate_tone_fraction: float = 0.60 # skip the gate if the 5 strongest sub-1 kHz noise bins hold this share
+    output_gain: float = 1.5         # max output gain (peak limited to 0.999)
 
 
 def _stft(x, cfg, sr):
@@ -183,6 +209,45 @@ def _gains(z, power, noise, n, cfg, sr):
     return gains
 
 
+# ----------------------------------------------------------------------------- 4th version
+def low_band_weight(sr, n_bins, cfg):
+    """Butterworth-shaped high-pass magnitude |H(f)| = 1/sqrt(1+(fc/f)^(2N)), floored."""
+    f = np.linspace(0, sr / 2, n_bins)
+    h = 1.0 / np.sqrt(1 + (cfg.hp_hz / np.maximum(f, 1.0)) ** (2 * cfg.hp_order))
+    return np.maximum(h, 10 ** (cfg.hp_floor_db / 20))
+
+
+def high_band_shelf(y, sr, cfg):
+    """Zero-phase low-pass part plus an attenuated copy of the remaining high band."""
+    if len(y) < 2:
+        return y.copy()
+    sos = signal.butter(cfg.shelf_order, min(cfg.shelf_hz, 0.45 * sr), "lowpass", fs=sr, output="sos")
+    try:
+        low = signal.sosfiltfilt(sos, y)
+    except ValueError:                       # very short input
+        low = signal.sosfiltfilt(sos, y, padlen=len(y) - 1)
+    return low + 10 ** (-cfg.shelf_db / 20) * (y - low)
+
+
+def narrowband_fraction(noise, sr):
+    """Share of the sub-1 kHz noise power held by its 5 strongest bins."""
+    f = np.linspace(0, sr / 2, len(noise))
+    low = noise[f < 1000.0]
+    return float(np.sort(low)[-5:].sum() / max(low.sum(), 1e-12))
+
+
+def temporal_gate(y, sr, cfg):
+    """Attenuate quiet stretches of the output relative to the file's own level distribution."""
+    rms = np.sqrt(np.maximum(uniform_filter1d(y * y, max(1, round(0.04 * sr)), mode="nearest"), 1e-16))
+    margin = min(len(rms) // 4, round(0.1 * sr))
+    inner = rms[margin:-margin] if margin else rms
+    ref = max(float(np.percentile(inner, 20)), 1e-8)
+    level_db = 20 * np.log10(np.maximum(rms, 1e-8) / ref)
+    activity = np.clip((level_db - cfg.gate_threshold_db) / 6.0, 0.0, 1.0)
+    gain = cfg.gate_min_gain + (1 - cfg.gate_min_gain) * activity
+    return y * uniform_filter1d(gain, max(1, round(0.06 * sr)), mode="nearest")
+
+
 def enhance(x, sr=16000, cfg=Config()):
     """Denoise a 1-D waveform. Returns a float64 array of the same length."""
     x = np.asarray(x, dtype=np.float64)
@@ -196,4 +261,15 @@ def enhance(x, sr=16000, cfg=Config()):
     if cfg.floor_db is not None:                                 # second pass with corrected noise
         noise = speech_floor_correction(gains, power, noise, cfg, sr)
         gains = _gains(z, power, noise, n, cfg, sr)
-    return _istft(gains * z, n, cfg, sr)
+    if cfg.hp_hz:
+        gains = gains * low_band_weight(sr, len(power), cfg)[:, None]
+    y = _istft(gains * z, n, cfg, sr)
+    if cfg.shelf_hz:
+        y = high_band_shelf(y, sr, cfg)
+    if cfg.gate_threshold_db and narrowband_fraction(initial_noise(power, cfg), sr) < cfg.gate_tone_fraction:
+        y = temporal_gate(y, sr, cfg)
+    if cfg.output_gain:
+        peak = np.max(np.abs(y))
+        if peak > 0:
+            y = y * min(cfg.output_gain, 0.999 / peak)
+    return y

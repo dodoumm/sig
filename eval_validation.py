@@ -7,6 +7,8 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+import io
+
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -19,8 +21,14 @@ def _score(job):
     from pesq import pesq
     clean, sr = sf.read(root / r["clean_path"], dtype="float64")
     noisy, _ = sf.read(root / r["noisy_path"], dtype="float64")
+    # score what enhance.py actually writes: same WAV format/subtype as the input, re-read
+    info = sf.info(root / r["noisy_path"])
+    buf = io.BytesIO()
+    sf.write(buf, np.clip(enhance(noisy, sr), -1.0, 1.0), sr, format=info.format, subtype=info.subtype)
+    buf.seek(0)
+    ours, _ = sf.read(buf, dtype="float64")
     out = []
-    for name, sig in (("noisy_input", noisy), ("ours", enhance(noisy, sr))):
+    for name, sig in (("noisy_input", noisy), ("ours", ours)):
         out.append({"segment_id": r["segment_id"], "method": name,
                     "noise_category": r["noise_category"], "target_snr_db": r["target_snr_db"],
                     "pesq": pesq(sr, clean, sig, "wb"),
